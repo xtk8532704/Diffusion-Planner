@@ -1,4 +1,4 @@
-"""Build wandb log payloads for full-route (per-site) closed-loop validation."""
+"""Build wandb log payloads for full-route (per-group) closed-loop validation."""
 
 from __future__ import annotations
 
@@ -17,10 +17,11 @@ from scenario_generation.trajectory_colormap import METRIC_CHOICES, render_traje
 
 
 def _is_noobj_label(label: str) -> bool:
-    """True for the empty-world-ablation site label convention (``{site}__noobj``). Used to
-    exclude ablation labels from collision-style aggregates that are 0 by construction in that
-    mode."""
-    return label.endswith("__noobj")
+    """True for the empty-world-ablation group label convention.
+
+    Supports both old format ``{group}__noobj`` and new format ``{json_name}__noobj/{group}``.
+    """
+    return "__noobj" in label
 
 
 def episode_stem(out_dir: str | Path, row: dict) -> str:
@@ -28,7 +29,7 @@ def episode_stem(out_dir: str | Path, row: dict) -> str:
 
     FullRouteClosedLoopEvaluation (PR2, train-time closed-loop validation) names these
     ``{route}_{start}_{end}`` (segment-suffixed). PR1's ``run_closed_loop_eval`` (the
-    ``valid_predictor_closed_loop.py`` / ``run_all_sites_closed_loop.py`` CLI path) names
+    ``valid_predictor_closed_loop.py`` / ``run_all_groups_closed_loop.py`` CLI path) names
     them just ``{route}`` -- one route = one whole-route rollout, no sub-segmenting.
     Prefer the segment-suffixed form and fall back to the bare route name when that
     file/dir doesn't exist, so callers resolve videos correctly for either pipeline.
@@ -49,7 +50,7 @@ def _segment_paths(out_dir: str | Path, row: dict) -> tuple[Path, Path]:
 
 
 def pick_representative_row(rows: list[dict], mode: str = "worst") -> dict | None:
-    """Pick one segment row to represent a site's whole run (for the 1 video/image W&B keeps).
+    """Pick one segment row to represent a group's whole run (for the 1 video/image W&B keeps).
 
     ``mode``: ``"worst"`` (default) = most collision steps, tie-broken by smallest
     min_clearance — the case most worth a human's attention. ``"first"`` = first
@@ -73,7 +74,7 @@ def pick_representative_row(rows: list[dict], mode: str = "worst") -> dict | Non
 
 
 EPISODE_TABLE_COLUMNS = [
-    "site",
+    "group",
     "route",
     "segment",
     "n_steps_run",
@@ -89,13 +90,13 @@ EPISODE_TABLE_COLUMNS = [
 ]
 
 
-def _episode_row(table: wandb.Table, site: str, r: dict, out_dir: str | Path | None) -> None:
+def _episode_row(table: wandb.Table, group: str, r: dict, out_dir: str | Path | None) -> None:
     seg = r.get("segment")
     seg_str = f"[{seg[0]},{seg[1]}]" if seg else ""
     video_path = str(_segment_paths(out_dir, r)[1]) if out_dir is not None else ""
     comp = r.get("route_completion")
     table.add_data(
-        site,
+        group,
         r.get("route", ""),
         seg_str,
         int(r.get("n_steps_run", 0)),
@@ -112,17 +113,17 @@ def _episode_row(table: wandb.Table, site: str, r: dict, out_dir: str | Path | N
 
 
 def build_combined_episode_table(
-    site_episodes: list[tuple[str, list[dict], str | Path | None]],
+    group_episodes: list[tuple[str, list[dict], str | Path | None]],
 ) -> wandb.Table:
-    """ONE episode table across every site (``site`` column filled per row), so the W&B UI's
-    native sort/filter/group-by works across the whole run — group by ``site``, sort by
+    """ONE episode table across every group (``group`` column filled per row), so the W&B UI's
+    native sort/filter/group-by works across the whole run — group by ``group``, sort by
     ``n_collision_events`` desc, etc. — in a single interactive panel instead of one table
-    per site. ``site_episodes`` is ``[(site_name, rows, out_dir), ...]``.
+    per group. ``group_episodes`` is ``[(group_name, rows, out_dir), ...]``.
     """
     table = wandb.Table(columns=EPISODE_TABLE_COLUMNS)
-    for site, rows, out_dir in site_episodes:
+    for group, rows, out_dir in group_episodes:
         for r in rows:
-            _episode_row(table, site, r, out_dir)
+            _episode_row(table, group, r, out_dir)
     return table
 
 
@@ -140,13 +141,17 @@ def resolve_report_link(out_dir: str | Path, report_base_url: str | None = None)
     return str(out_dir.resolve())
 
 
-def build_sites_aggregate_log(summaries: dict[str, dict]) -> dict:
-    """Cross-site rollup under ``closed_loop_overview/`` (the at-a-glance block): the segment-
+def build_groups_aggregate_log(
+    summaries: dict[str, dict],
+    *,
+    prefix: str = "closed_loop_overview",
+) -> dict:
+    """Cross-group rollup under ``<prefix>/`` (default: ``closed_loop_overview/``): the segment-
     weighted mean route-completion (so long routes aren't under-weighted), plus the plain
-    cross-site SUM of each event count. Deliberately just the small non-saturating set — no
-    segment-rates / min-clearances / means (those stay in each site's summary.json only).
+    cross-group SUM of each event count. Deliberately just the small non-saturating set — no
+    segment-rates / min-clearances / means (those stay in each group's summary.json only).
 
-    ``summaries`` is keyed by site LABEL — a ``{site}__noobj`` label is excluded from
+    ``summaries`` is keyed by group LABEL — a ``__noobj`` label is excluded from
     collision-style sums (``OBJECTS_ONLY_OVERVIEW_SUM_KEYS``), since those are 0 by
     construction in the empty-world ablation and would just dilute the objects-mode number
     with zeros.
@@ -156,76 +161,99 @@ def build_sites_aggregate_log(summaries: dict[str, dict]) -> dict:
         return log
     values = list(summaries.values())
     objects_values = [s for label, s in summaries.items() if not _is_noobj_label(label)]
-    n_sites = len(values)
+    n_groups = len(values)
     total_segments = sum(int(s.get("n_segments", 0)) for s in values)
 
-    log["closed_loop_overview/n_sites"] = n_sites
-    log["closed_loop_overview/n_segments"] = total_segments
+    log[f"{prefix}/n_groups"] = n_groups
+    log[f"{prefix}/n_segments"] = total_segments
 
     comp_num = sum(
         float(s.get("mean_route_completion", 0.0)) * int(s.get("n_segments", 0)) for s in values
     )
-    log["closed_loop_overview/route_completion"] = (
-        comp_num / total_segments if total_segments else 0.0
-    )
+    log[f"{prefix}/route_completion"] = comp_num / total_segments if total_segments else 0.0
 
     for key in COMPARISON_OVERVIEW_SUM_KEYS:
-        log[f"closed_loop_overview/{key}"] = sum(int(extract_score(s, key) or 0) for s in values)
+        log[f"{prefix}/{key}"] = sum(int(extract_score(s, key) or 0) for s in values)
     for key in OBJECTS_ONLY_OVERVIEW_SUM_KEYS:
-        log[f"closed_loop_overview/{key}"] = sum(
-            int(extract_score(s, key) or 0) for s in objects_values
-        )
+        log[f"{prefix}/{key}"] = sum(int(extract_score(s, key) or 0) for s in objects_values)
 
     return {k: v for k, v in log.items() if _wandb_scalar(v) or isinstance(v, int)}
 
 
-def _site_label(site: str | None) -> str:
-    """W&B-key-safe site token; ``None`` (single-npz_root mode) -> ``"main"``."""
-    return (site or "main").replace("/", "_")
+def _group_label(group: str | None) -> str:
+    """W&B-key-safe group token; ``None`` (single-npz_root mode) -> ``"main"``."""
+    return (group or "main").replace("/", "_")
 
 
 def build_full_closed_loop_wandb_log(
     summary: dict,
     *,
     out_dir: str | Path | None = None,
-    site: str | None = None,
+    group: str | None = None,
     video_pick: str = "worst",
     colormap_metrics: tuple[str, ...] = METRIC_CHOICES,
     near_miss_thresh: float = 0.5,
     report_base_url: str | None = None,
     render_media: bool = True,
+    wandb_key_prefix: str | None = None,
 ) -> dict:
-    """Per-site full-route closed-loop wandb payload, keyed into role-based sections so the
+    """Per-group full-route closed-loop wandb payload, keyed into role-based sections so the
     workspace stays navigable (one collapsible section each) instead of one flat ``closed_loop``
     blob of 100+ panels:
 
-    - ``closed_loop_scores/{metric}/{site}`` — scalar trends (metric-first so the same metric's
-      sites sort adjacently; the W&B panel-search box filters by either metric or site token).
-    - ``closed_loop_media/{site}`` — ONE gallery panel holding every ``colormap_metrics`` image
+    - ``closed_loop_scores/{metric}/{group}`` — scalar trends (metric-first so the same metric's
+      groups sort adjacently; the W&B panel-search box filters by either metric or group token).
+    - ``closed_loop_media/{group}`` — ONE gallery panel holding every ``colormap_metrics`` image
       for the representative episode (captioned by metric), mirroring the HTML report's
-      per-card metric dropdown; ``closed_loop_media/{site}__video`` — that episode's video.
-    - ``closed_loop_links/{site}`` — where the full report (all videos + HTML) lives.
+      per-card metric dropdown; ``closed_loop_media/{group}__video`` — that episode's video.
+    - ``closed_loop_links/{group}`` — where the full report (all videos + HTML) lives.
+
+    If ``wandb_key_prefix`` is set (e.g. ``override/departure``), it replaces the
+    ``closed_loop_scores/``, ``closed_loop_media/``, ``closed_loop_links/`` prefix, allowing
+    arbitrary nesting like ``closed_loop/<metric>/override/departure``.
 
     ``render_media=False`` skips the video + colormap-image block entirely (scores/links are
     unaffected) -- for a caller that already skipped rendering (e.g. train.py's RolloutParams
     ``draw=False`` on most epochs), so there's no colormap image to render from anyway.
 
-    The per-episode table is built once across ALL sites by :func:`build_combined_episode_table`
+    The per-episode table is built once across ALL groups by :func:`build_combined_episode_table`
     at the caller (so it's a single filterable/groupable panel), not here.
     """
-    label = _site_label(site)
+    label = _group_label(group)
     log: dict = {}
+
+    def _key(suffix: str) -> str:
+        """Build wandb key, optionally prefixed.
+
+        suffix format: "scores/{metric}/{label}" or "media/{label}" or "links/{label}"
+
+        Without prefix: "closed_loop_scores/collision/label" (original format)
+        With prefix "override/departure": "closed_loop/collision/override/departure/label"
+        """
+        if wandb_key_prefix is None:
+            return f"closed_loop_{suffix}"
+        # Extract metric from "scores/{metric}/..." or put everything after prefix
+        parts = suffix.split("/", 3)
+        if parts[0] == "scores" and len(parts) >= 3:
+            # "scores/collision/label" -> metric=collision, rest=label
+            metric = parts[1]
+            label = parts[2]
+            return f"closed_loop/{metric}/{wandb_key_prefix}/{label}"
+        # media, links: "media/label__video" or "links/label"
+        rest = "/".join(parts[1:])
+        return f"closed_loop/{wandb_key_prefix}/{rest}"
+
     for key in SCORE_KEYS:
         val = extract_score(summary, key)
         if _wandb_scalar(val):
-            log[f"closed_loop_scores/{key}/{label}"] = val
+            log[_key(f"scores/{key}/{label}")] = val
 
     rows = summary.get("segments") or []
     rep = pick_representative_row(rows, mode=video_pick)
     if render_media and rep is not None and out_dir is not None:
         png_dir, mp4_path = _segment_paths(out_dir, rep)
         if mp4_path.is_file():
-            log[f"closed_loop_media/{label}__video"] = wandb.Video(str(mp4_path), format="mp4")
+            log[_key(f"media/{label}__video")] = wandb.Video(str(mp4_path), format="mp4")
         try:
             rendered = render_trajectory_colormaps(
                 png_dir,
@@ -234,24 +262,21 @@ def build_full_closed_loop_wandb_log(
                 metrics=colormap_metrics,
                 near_miss_thresh=near_miss_thresh,
                 strong_brake_mps2=summary.get("strong_brake", {}).get("thresh_mps2", -2.5),
-                title=f"{site or ''} {mp4_path.stem}".strip(),
+                title=f"{group or ''} {mp4_path.stem}".strip(),
             )
         except Exception as e:  # pragma: no cover - rendering must never break training
             print(f"closed_loop: trajectory colormap failed for {mp4_path.stem}: {e}")
             rendered = {}
-        # One gallery panel per site: a list of images under a single key (captioned by metric)
-        # -> the metric becomes an in-panel selector, not N separate panels. Ordered by the
-        # requested colormap_metrics so the gallery is stable across epochs/sites.
         gallery = [
             wandb.Image(str(rendered[m]), caption=m) for m in colormap_metrics if m in rendered
         ]
         if gallery:
-            log[f"closed_loop_media/{label}"] = gallery
+            log[_key(f"media/{label}")] = gallery
 
     if out_dir is not None:
-        log[f"closed_loop_links/{label}"] = resolve_report_link(out_dir, report_base_url)
+        log[_key(f"links/{label}")] = resolve_report_link(out_dir, report_base_url)
     elif summary.get("npz_root"):
-        log[f"closed_loop_links/{label}"] = str(summary["npz_root"])
+        log[_key(f"links/{label}")] = str(summary["npz_root"])
     return log
 
 
